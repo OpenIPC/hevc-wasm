@@ -1,28 +1,34 @@
-<!doctype html><meta charset=utf-8><title>wasm h265</title>
+<!doctype html><meta charset=utf-8><title>hevc-wasm</title>
 <style>body{background:#111;color:#ddd;font:13px system-ui;margin:0}
 canvas{width:100%;max-width:1280px;display:block;background:#000}
-pre{padding:8px;margin:0;white-space:pre-wrap}</style>
+pre{padding:8px;margin:0;white-space:pre-wrap;line-height:1.6}</style>
 <canvas id=c></canvas><pre id=log>starting…</pre>
-<script>window.MJ_WASM_BASE='/a/hevc/';</script>
-<script src="/a/preview-wasm.js"></script>
-<script>
-const log = document.getElementById('log');
-const lines = {};
-const show = () => log.textContent = Object.entries(lines).map(([k,v])=>k+': '+v).join('\n');
-lines.available = MajesticWasm.available;
-show();
-const p = MajesticWasm.attach(document.getElementById('c'), {
-  stream: 0,
-  onState: (s,d) => { lines.state = s + (d ? ' ('+d+')' : ''); show(); },
-  onCodec: (c,cs,w,h) => { lines.codec = c+' '+w+'x'+h; show(); },
-  onNote: (n) => { lines.notes = (lines.notes ? lines.notes + ' | ' : '') + n; show(); },
-  onStats: (s) => {
-    lines.stats = 'fps '+s.fps+' · decode '+s.meanDecodeMs.toFixed(1)+'ms/frame'
-      +' · decoded '+s.framesDecoded+' · dropped '+s.framesDropped
-      +' · gopDrops '+s.gopDrops+' · queued '+s.queuedFrames
-      +' · idrReq '+s.idrRequests+' · behind '+s.queuedMs+'ms · iv '+s.sourceIntervalMs+'ms';
-    show();
-  },
-});
-setTimeout(() => { lines.switched = 'asked for stream 1'; show(); p.setStream(1); }, 10000);
+<script type=module>
+// Minimal driver: point it at a camera's /ws/video and watch the numbers. Same
+// worker the WebUI uses, without any of the page around it.
+import { makePainter } from './paint.js';
+import { parseHvcC, fragmentNals, toAnnexB, nalType, isRap } from './demux.js';
+const log = document.getElementById('log'), lines = {};
+const show = () => log.textContent = Object.entries(lines).map(([k, v]) => k + ': ' + v).join('\n');
+const canvas = document.getElementById('c');
+const w = new Worker(new URL('./decoder-worker.js', import.meta.url), { type: 'module' });
+const off = canvas.transferControlToOffscreen();
+const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+w.onmessage = (e) => {
+  const m = e.data;
+  if (m.type === 'state') lines.state = m.state + (m.detail ? ' (' + m.detail + ')' : '');
+  else if (m.type === 'codec') lines.codec = m.codec + ' ' + m.width + 'x' + m.height;
+  else if (m.type === 'stats') {
+    const s = m.stats;
+    lines.stats = 'decoded ' + s.frames + ' · dropped ' + s.dropped +
+      ' · gopDrops ' + s.gopDrops + ' · idrReq ' + s.idrRequests +
+      ' · queued ' + s.queuedFrames + ' (' + s.queuedMs + 'ms)' +
+      ' · source interval ' + s.sourceIntervalMs + 'ms';
+  }
+  show();
+};
+w.postMessage({ type: 'start',
+  url: proto + '://' + location.host + '/ws/video?stream=' + (new URLSearchParams(location.search).get('stream') || 0),
+  canvas: off }, [off]);
+setInterval(() => w.postMessage({ type: 'stats' }), 1000);
 </script>
