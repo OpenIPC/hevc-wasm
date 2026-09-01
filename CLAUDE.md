@@ -22,14 +22,33 @@ what consumers pin to.
 Do not redesign against these without re-checking them — every one was
 verified, and each rules out an obvious alternative.
 
-- **A camera serves plain HTTP.** So the page is **not a secure context**, and
-  that removes: **WebCodecs** (`VideoDecoder` is `[SecureContext]`),
-  **SharedArrayBuffer** and therefore **WASM pthreads**, and
-  **MediaStreamTrackGenerator** (so a decoder cannot feed a `<video>`).
+- **A camera serves plain HTTP _by default_.** So the page is normally **not a
+  secure context**, and that removes: **WebCodecs** (`VideoDecoder` is
+  `[SecureContext]`), **SharedArrayBuffer** and therefore **WASM pthreads**,
+  and **MediaStreamTrackGenerator** (so a decoder cannot feed a `<video>`).
   WASM **SIMD** survives — it needs no cross-origin isolation — and so does
   **OffscreenCanvas**, which is what makes the worker design possible.
-- **Single-threaded.** libde265's `frame-parallel` branch needs threads and is
-  unusable here.
+
+  **This is a default, not a law, and the distinction matters.** An operator can
+  reach a secure context two ways: majestic serves TLS itself
+  (`system.httpsPort`, `system.httpsCertificate`, `system.httpsCertificateKey`),
+  or a reverse proxy terminates HTTPS in front of the camera. Do not write
+  "plain HTTP" as a premise without saying which it is.
+
+  HTTPS alone still is not enough for threads: `SharedArrayBuffer` needs
+  **cross-origin isolation**, which is HTTPS *plus* `Cross-Origin-Opener-Policy:
+  same-origin` and `Cross-Origin-Embedder-Policy: require-corp` on the page.
+  majestic sends neither today, so that is the real gap — and a reverse proxy
+  can add them without touching the daemon. jsDelivr already serves
+  `access-control-allow-origin: *` and `cross-origin-resource-policy:
+  cross-origin`, so the CDN-hosted decoder keeps loading under isolation.
+- **Single-threaded, for the default deployment.** libde265's `frame-parallel`
+  branch needs threads, so it is unusable as things stand — but it is the
+  obvious upgrade for an isolated context, and single-threaded 4K measures
+  ~49 ms/frame against a ~33 ms arrival interval, so threading is the only
+  thing that could make 4K viable at all. On a secure context **WebCodecs is
+  the bigger prize**: where the platform has HEVC it means hardware decode,
+  which beats every path in this repository.
 - **A Worker cannot be constructed from a cross-origin URL.** Consumers fetch
   `decoder-worker.js` as text and run it from a blob, rewriting its relative
   imports to absolute — the blob's base URL is useless.

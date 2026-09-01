@@ -10,10 +10,16 @@ A camera on `video0.codec: h265` is unplayable in a browser without native
 HEVC — WebRTC cannot negotiate what the browser will not decode, and MSE's
 `isTypeSupported()` refuses the mime. This decodes it instead.
 
-The constraint that shapes everything: a camera serves plain HTTP, so the page
-is **not a secure context**. That rules out WebCodecs, SharedArrayBuffer (and
-therefore WASM threads), and MediaStreamTrackGenerator. `OffscreenCanvas`
-survives, which is what makes the design possible.
+The constraint that shapes everything: a camera serves plain HTTP **by
+default**, so the page is normally **not a secure context**. That rules out
+WebCodecs, SharedArrayBuffer (and therefore WASM threads), and
+MediaStreamTrackGenerator. `OffscreenCanvas` survives, which is what makes the
+design possible.
+
+It is a default rather than a limit — majestic can serve TLS itself, or a
+reverse proxy can — but threads additionally need cross-origin isolation
+(`COOP: same-origin` + `COEP: require-corp`), which majestic does not send
+today. See `docs/design.md`.
 
 ## Build
 

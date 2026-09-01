@@ -60,3 +60,31 @@ the split.
 without returning to its event loop, so `destroy` and `setStream` are seen
 promptly rather than after a 4K IDR. That is a different and smaller claim than
 the one it was originally reached for, and it is worth stating plainly.
+
+## The escape hatch, and why it is not taken here
+
+Everything above assumes the page is not a secure context, which is the default
+for a camera and not a law. An operator can change it — majestic serves TLS
+itself (`system.httpsPort` and a certificate pair), or a reverse proxy
+terminates HTTPS in front. Threads need more than that: cross-origin isolation
+is HTTPS **plus** `Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp` on the page, and majestic sends
+neither today. A proxy can add them without touching the daemon.
+
+If that is done, two things change and both are larger than anything in this
+document:
+
+- **WebCodecs becomes available**, and on a client whose platform has HEVC that
+  is *hardware* decode. It does not make this decoder faster; it makes it
+  unnecessary on those machines, which is the better outcome.
+- **pthreads become available**, which makes libde265's `frame-parallel` branch
+  usable. Single-threaded 4K is ~49 ms/frame against a ~33 ms arrival interval,
+  so threading is the only thing that could make 4K viable at all.
+
+Nothing about the CDN choice blocks this: jsDelivr already serves
+`access-control-allow-origin: *` and `cross-origin-resource-policy:
+cross-origin`, so the module keeps loading under `require-corp`.
+
+So the single-threaded, canvas-painting design here is the right answer for the
+deployment almost everyone has, and the wrong answer for a deployment somebody
+has deliberately hardened. Say which one you are describing.
