@@ -1,4 +1,2 @@
-build/
-dist/
-fixtures/
 node_modules/
+fixtures/

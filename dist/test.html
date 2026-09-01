@@ -1,0 +1,28 @@
+<!doctype html><meta charset=utf-8><title>wasm h265</title>
+<style>body{background:#111;color:#ddd;font:13px system-ui;margin:0}
+canvas{width:100%;max-width:1280px;display:block;background:#000}
+pre{padding:8px;margin:0;white-space:pre-wrap}</style>
+<canvas id=c></canvas><pre id=log>starting…</pre>
+<script>window.MJ_WASM_BASE='/a/hevc/';</script>
+<script src="/a/preview-wasm.js"></script>
+<script>
+const log = document.getElementById('log');
+const lines = {};
+const show = () => log.textContent = Object.entries(lines).map(([k,v])=>k+': '+v).join('\n');
+lines.available = MajesticWasm.available;
+show();
+const p = MajesticWasm.attach(document.getElementById('c'), {
+  stream: 0,
+  onState: (s,d) => { lines.state = s + (d ? ' ('+d+')' : ''); show(); },
+  onCodec: (c,cs,w,h) => { lines.codec = c+' '+w+'x'+h; show(); },
+  onNote: (n) => { lines.notes = (lines.notes ? lines.notes + ' | ' : '') + n; show(); },
+  onStats: (s) => {
+    lines.stats = 'fps '+s.fps+' · decode '+s.meanDecodeMs.toFixed(1)+'ms/frame'
+      +' · decoded '+s.framesDecoded+' · dropped '+s.framesDropped
+      +' · gopDrops '+s.gopDrops+' · queued '+s.queuedFrames
+      +' · idrReq '+s.idrRequests+' · behind '+s.queuedMs+'ms · iv '+s.sourceIntervalMs+'ms';
+    show();
+  },
+});
+setTimeout(() => { lines.switched = 'asked for stream 1'; show(); p.setStream(1); }, 10000);
+</script>
