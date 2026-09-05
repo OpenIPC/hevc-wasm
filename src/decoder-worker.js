@@ -21,6 +21,29 @@ let M = null, dec = null, ws = null, paint = null, gl = null;
 let lengthSize = 4, started = false, closed = false;
 let queue = [];             // access units waiting to be decoded
 let queueBytes = 0;
+
+// Reconnect ladder, mirroring the MSE player (preview.js) exactly, because the
+// two rungs carry the same /ws/video bytes and a socket drop is no more fatal
+// to one than to the other. Without it a single dropped socket ended this rung
+// for good: the page's fallback chain reads one `unreachable` as "software
+// decode gave up" and falls to MJPEG with no way back, so a transient blip —
+// the camera's own reload, a lost packet on a remote link, majestic's
+// data-frame-after-close race on a rapid channel reopen — stranded a working
+// H.265 preview on MJPEG until the tab was reloaded (majestic-webui#288). So a
+// socket that drops mid-session is retried here, up to six times with the same
+// 1→2→4→8 s backoff the MSE player uses, and `unreachable` is reported only
+// once the ladder is spent. A DELIBERATE reopen (a channel change, the first
+// open) is not a failure and resets the ladder; a working reconnect (its init
+// arrives) resets it too. `sockEpoch` fences a stale socket's late close event
+// so it cannot start a reconnect after we have already moved on — the same
+// hazard preview.js's `discard()` guards, one socket per generation.
+const MAX_RECONNECTS = 6;
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_MAX_MS = 8000;
+let sockEpoch = 0;
+let reconnectTries = 0;
+let reconnectBackoff = RECONNECT_BASE_MS;
+let reconnectTimer = null;
 const stats = {
 	frames: 0, dropped: 0, gopDrops: 0, decodeMs: 0, bytes: 0,
 	lastDecodeMs: 0, width: 0, height: 0, idrRequests: 0,
@@ -80,6 +103,7 @@ function queuedMs() {
 function fail(reason) {
 	if (closed) return;
 	closed = true;
+	if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 	post('state', { state: 'mjpeg', detail: reason });
 	try { ws && ws.close(); } catch (e) {}
 }
@@ -205,14 +229,40 @@ async function start(opts) {
 	pump();
 }
 
+// A socket dropped mid-session: retry, or give up once the ladder is spent.
+// `reconnect` is true when this drop is the ladder itself firing, so the first
+// unprompted failure schedules from a fresh backoff rather than inheriting a
+// stale one. Deliberate reopens (channel change, first open) never come here.
+function scheduleReconnect() {
+	if (closed || reconnectTimer) return;
+	if (++reconnectTries > MAX_RECONNECTS) { fail('unreachable'); return; }
+	const wait = reconnectBackoff;
+	reconnectTimer = setTimeout(() => {
+		reconnectTimer = null;
+		reconnectBackoff = Math.min(reconnectBackoff * 2, RECONNECT_MAX_MS);
+		openSocket(wsUrl, true);
+	}, wait);
+}
+
 // The socket lives here, so a channel change is reopened here too rather than
 // costing the page a whole new player -- and the decoder is reset with it,
 // because the parameter sets of the channel being left do not describe the one
 // being joined.
+//
+// `reconnect` distinguishes the ladder firing from a deliberate (re)open. A
+// deliberate open is a fresh start: cancel any pending retry and reset the
+// ladder, because the person changed channel or the session is only now
+// beginning, and neither is a failure to count against `unreachable`.
 let wsUrl = '';
-function openSocket(url) {
+function openSocket(url, reconnect) {
 	wsUrl = url;
-	if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} }
+	if (!reconnect) {
+		if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+		reconnectTries = 0;
+		reconnectBackoff = RECONNECT_BASE_MS;
+	}
+	const myEpoch = ++sockEpoch;
+	if (ws) { try { ws.onclose = null; ws.onerror = null; ws.close(); } catch (e) {} }
 	queue = []; queueBytes = 0;
 	if (dec) M._de_reset(dec);
 	ws = new WebSocket(url);
@@ -242,6 +292,11 @@ function openSocket(url) {
 			// fragment, so a decoder fed only fragments has no SPS and refuses
 			// every slice it is given.
 			init = u8;
+			// A reconnect that reached its init is a working socket again, so
+			// the next drop starts a fresh ladder rather than counting toward an
+			// `unreachable` that has already been recovered from.
+			reconnectTries = 0;
+			reconnectBackoff = RECONNECT_BASE_MS;
 			const hv = parseHvcC(u8);
 			if (!hv) return fail('demux-failed');
 			lengthSize = hv.lengthSize;
@@ -256,8 +311,13 @@ function openSocket(url) {
 		queueBytes += bytes.length;
 		if (queueBytes > MAX_QUEUE_BYTES || queuedMs() > MAX_LATENCY_MS) dropToRap();
 	};
-	ws.onclose = () => fail('unreachable');
-	ws.onerror = () => fail('unreachable');
+	// A drop, not an ending: retry rather than fall to MJPEG. Fenced by the
+	// epoch so a close event from a socket we have already replaced (a channel
+	// change landed between this open and this close) cannot start a reconnect
+	// on top of the live one. onerror is followed by onclose, so let onclose be
+	// the single place that schedules.
+	ws.onclose = () => { if (!closed && myEpoch === sockEpoch) scheduleReconnect(); };
+	ws.onerror = () => {};
 }
 
 self.onmessage = (e) => {
@@ -276,6 +336,7 @@ self.onmessage = (e) => {
 	}) });
 	else if (m.type === 'destroy') {
 		closed = true;
+		if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 		try { ws && ws.close(); } catch (err) {}
 		if (dec) { M._de_destroy(dec); dec = null; }
 	}
