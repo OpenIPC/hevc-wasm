@@ -15,10 +15,15 @@ jobs:
         with:
           node-version: '20'
 
-      # 1. The source parses.
+      # 1. The source parses. Explicit set -e so a parse error in any file
+      #    fails the step, not just the last one checked.
       - name: syntax
         run: |
-          for f in src/*.js tools/*.mjs; do node --check "$f"; done
+          set -e
+          for f in src/*.js tools/*.mjs; do
+            echo "check $f"
+            node --check "$f"
+          done
 
       # 2. The CDN artifact must not drift from source. decoder-worker.js,
       #    demux.js and paint.js in dist/ are straight copies of src/ (see
