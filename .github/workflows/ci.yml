@@ -41,11 +41,19 @@ jobs:
       - name: install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
-      - name: generate a fixture
+      - name: generate a camera-shaped fixture
+        # A real camera bitstream is the honest input (closed GOP, periodic IDR,
+        # no B-frames, multiple slices), but the captured fixtures come off lab
+        # cameras and are kept out of this public repo (fixtures/ is gitignored;
+        # see tools/capture.mjs). So shape a synthetic stream like one instead;
+        # camera-fidelity decoding is exercised by tools/measure.mjs against a
+        # real camera and by the majestic-webui integration.
         run: >
           ffmpeg -v error -f lavfi
-          -i testsrc=size=1280x720:rate=5:duration=2
-          -c:v libx265 -x265-params log-level=error -f hevc test-720p.h265
+          -i testsrc=size=1280x720:rate=15:duration=2
+          -c:v libx265
+          -x265-params "log-level=error:keyint=15:min-keyint=15:no-open-gop=1:bframes=0:slices=4"
+          -f hevc test-720p.h265
 
       - name: decode smoke test (shipped dist artifact)
         run: node tools/smoke.mjs test-720p.h265 1280 720

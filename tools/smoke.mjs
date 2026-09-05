@@ -6,8 +6,21 @@
 // here rather than on a camera.
 //
 //   node tools/smoke.mjs <file.h265> <expectedWidth> <expectedHeight>
-import { readFileSync } from 'node:fs';
-import createDe265 from '../dist/de265.js';
+import { readFileSync, copyFileSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+// dist/de265.js is an ES6 module (emscripten EXPORT_ES6), but the repo has no
+// package.json declaring "type":"module", so a bare `.js` import can be read as
+// CommonJS on older Node and fail on its import.meta/export. Copy it to a
+// `.mjs` — with its `.wasm` alongside, since the module finds the wasm through
+// import.meta.url — and import that, so this loads as ESM on any Node.
+const distDir = fileURLToPath(new URL('../dist/', import.meta.url));
+const tmp = mkdtempSync(join(tmpdir(), 'de265-'));
+copyFileSync(distDir + 'de265.js', join(tmp, 'de265.mjs'));
+copyFileSync(distDir + 'de265.wasm', join(tmp, 'de265.wasm'));
+const { default: createDe265 } = await import(pathToFileURL(join(tmp, 'de265.mjs')).href);
 
 const [, , file, ewArg, ehArg] = process.argv;
 if (!file) { console.error('usage: smoke.mjs <file.h265> <w> <h>'); process.exit(2); }
