@@ -45,6 +45,47 @@ Two traps, both costly to rediscover:
 
 Artifact: ~418 KB `.wasm`.
 
+## Feeding the worker yourself
+
+By default the worker opens the camera's `/ws/video` socket itself (the
+reasons are in the source: nothing frame-sized crosses a thread, and a
+hidden tab cannot starve it). A page can own the transport instead — an
+`RTCDataChannel` cannot be created in or transferred into a worker, and a
+camera that carries the same bitstream over one needs exactly this:
+
+```js
+w.postMessage({ type: 'start', feed: true, url, canvas: off }, [off]);
+// -> { type: 'feed', ok: true, protocol: 1 }   nothing was opened
+w.postMessage({ type: 'msg', data: initText });             // the text `init`
+w.postMessage({ type: 'msg', data: initSegment, kind: 2 }); // ftyp+moov
+w.postMessage({ type: 'msg', data: fragment, kind: 3 }, [fragment]); // [prft] moof+mdat
+w.postMessage({ type: 'gap' });    // frames were lost: decode nothing until a RAP
+w.postMessage({ type: 'reset' });  // the feed was replaced: a new init follows
+w.postMessage({ type: 'open', url }); // hand the transport back to the worker
+// <- { type: 'send', text }  what the worker would have written to the socket
+```
+
+`msg` carries a `/ws/video` message verbatim: the text `init`, the binary
+init segment (`kind: 2`) or a fragment (`kind: 3`); without `kind`, the
+first binary message is the init, as on the socket. A fragment that arrives
+before any init is counted (`stats.noInit`) and dropped. `gap` is the
+page's word that frames are missing — heard from the camera, or a hole it
+found itself — and the worker then decodes nothing until the next random
+access point; the request for a keyframe is the page's to make, so the two
+do not double up. The `idr` message still works and leaves as `send`.
+
+A fragment may start with a producer reference time (`prft`, ISO 14496-12
+§8.16.5), which a camera puts there when it knows the frame's capture
+instant. The worker strips it and reports capture-to-paint lag in `stats`:
+`lag: { n, p50, p95, max }` and the raw `lagMs` samples since the last
+report. The spread is exact; the absolute figure carries the camera's clock
+offset from this machine's.
+
+`dist/test.html?feed=ws` runs this mode over a plain WebSocket the page
+opens, so the byte compatibility can be checked against any camera;
+`tools/feed-test.mjs` runs it under Node against an ffmpeg-made stream and
+is part of CI.
+
 ## Measured
 
 Single-threaded + SIMD, x86 desktop, against bitstreams captured from a real
