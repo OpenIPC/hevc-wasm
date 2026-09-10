@@ -57,7 +57,10 @@ verified, and each rules out an obvious alternative.
 
 One Web Worker owns the WebSocket, the fMP4 demux, the decoder and the canvas.
 The main thread sends `start`/`setStream`/`idr`/`stats`/`destroy` and **never
-sees a frame**: `transferControlToOffscreen()` gives the worker the WebGL
+sees a frame**. Since v0.2.0 the page may own the transport instead — `start`
+with `feed: true`, then `msg`/`gap`/`reset`/`open` in and `send` out — for
+a transport a worker cannot hold (an `RTCDataChannel`); README has the
+protocol and `tools/feed-test.mjs` pins it. Without `feed` nothing changed: `transferControlToOffscreen()` gives the worker the WebGL
 context, so a decoded picture goes from the wasm heap to `texSubImage2D`
 without crossing a thread.
 

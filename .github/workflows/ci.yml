@@ -62,3 +62,18 @@ jobs:
 
       - name: decode smoke test (shipped dist artifact)
         run: node tools/smoke.mjs test-720p.h265 1280 720
+
+      - name: generate a /ws/video-shaped fMP4 fixture
+        # The same stream as a fragmented MP4 with one fragment per frame —
+        # the shape /ws/video delivers — for the worker's feed mode.
+        run: >
+          ffmpeg -v error -f lavfi
+          -i testsrc=size=1280x720:rate=15:duration=4
+          -c:v libx265
+          -x265-params "log-level=error:keyint=15:min-keyint=15:no-open-gop=1:bframes=0"
+          -tag:v hvc1
+          -movflags frag_every_frame+empty_moov+default_base_moof
+          -f mp4 test-720p.mp4
+
+      - name: feed-mode test (the worker driven by a page-owned transport)
+        run: node tools/feed-test.mjs test-720p.mp4

@@ -88,6 +88,28 @@ export function fragmentNals(frag, lengthSize = 4) {
 	return out;
 }
 
+// A producer reference time (ISO 14496-12 §8.16.5) the camera may put before
+// a fragment's moof: version 1, reference track, an NTP64 timestamp of the
+// frame's capture instant and the media time it refers to. Present only when
+// the camera knows the instant as a fact. Returns { wallMs, next } — the
+// capture time as milliseconds since the Unix epoch and the offset of the
+// box that follows — or null when the fragment starts with something else.
+export function parsePrft(u8) {
+	if (u8.length < 28 || fourcc(u8, 4) !== 'prft') return null;
+	const version = u8[8];
+	// Version 0 carries a 32-bit media_time (28 bytes in all), version 1 a
+	// 64-bit one (32 bytes); the timestamp sits at the same offset in both.
+	const need = version === 0 ? 28 : version === 1 ? 32 : 0;
+	if (!need) return null;
+	const size = be32(u8, 0);
+	if (size < need || size > u8.length) return null;
+	// 8 header + 4 version/flags + 4 reference_track_ID, then ntp_timestamp.
+	const secs = be32(u8, 16) - 2208988800;
+	const frac = be32(u8, 20);
+	const wallMs = secs * 1000 + Math.round(frac / 4294967.296);
+	return { wallMs, next: size, version };
+}
+
 export function toAnnexB(nals) {
 	let n = 0;
 	for (const x of nals) n += 4 + x.length;

@@ -15,12 +15,45 @@
 // is unbounded. Here nothing is tied to the display clock.
 import createDe265 from './de265.js';
 import { makePainter } from './paint.js';
-import { parseHvcC, fragmentNals, toAnnexB, nalType, isRap } from './demux.js';
+import { parseHvcC, parsePrft, fragmentNals, toAnnexB, nalType, isRap } from './demux.js';
 
 let M = null, dec = null, ws = null, paint = null, gl = null;
 let lengthSize = 4, started = false, closed = false;
 let queue = [];             // access units waiting to be decoded
 let queueBytes = 0;
+
+// FEED MODE. The page can own the transport instead of this worker: it sends
+// `start` with `feed: true`, gets `feed` back, and then posts every message
+// the transport delivers as `msg` — the /ws/video text and binary frames,
+// verbatim — and receives `send` for what this worker would have written to
+// the socket (a keyframe request). Nothing is opened here in that mode and
+// the reconnect ladder is idle; a `gap` says the feed lost frames (the page
+// heard so from the camera, or saw a hole itself), `reset` that the feed was
+// replaced (a channel change), and `open` hands the transport back to this
+// worker with a URL, from which point everything behaves as before. A page
+// that never sends `feed` sees no difference at all.
+//
+// Why a feed exists: an RTCDataChannel cannot be created in, or transferred
+// into, a worker, and it is the transport that lets the same bytes arrive
+// with a lost packet costing one frame rather than a growing delay.
+let feed = false;
+// The init segment seen so far — hoisted from the socket handler so a feed
+// can replace it, and so a frame that arrives before any init is dropped
+// rather than handed to a decoder with no parameter sets.
+let init = null;
+// After a gap: nothing until the next random access point.
+let awaitRap = false;
+// Capture-to-paint lag, from the camera's producer reference time (prft)
+// when it sends one: the wall-clock capture instant of each decoded picture
+// is kept in arrival order and read out when the picture is painted. Both
+// clocks are this machine's for the paint half only, so the spread is exact
+// and the absolute figure carries the camera's clock offset.
+const pendingWall = [];
+let lagMs = [];
+// The newest samples only, between two reports: a page that asks once a
+// second never reaches the bound, and one that asks less often gets the
+// most recent stretch rather than an unbounded array.
+const LAG_KEEP = 240;
 
 // Reconnect ladder, mirroring the MSE player (preview.js) exactly, because the
 // two rungs carry the same /ws/video bytes and a socket drop is no more fatal
@@ -47,6 +80,7 @@ let reconnectTimer = null;
 const stats = {
 	frames: 0, dropped: 0, gopDrops: 0, decodeMs: 0, bytes: 0,
 	lastDecodeMs: 0, width: 0, height: 0, idrRequests: 0,
+	gaps: 0, noInit: 0, prft: false,
 };
 
 // TWO BOUNDS, because they answer different questions and each one alone lets
@@ -108,6 +142,16 @@ function fail(reason) {
 	try { ws && ws.close(); } catch (e) {}
 }
 
+// The feed lost frames, or the stream was replaced: throw the queue away,
+// reset the decoder, and decode nothing until a random access point.
+function flushToRap() {
+	stats.dropped += queue.length;
+	queue = []; queueBytes = 0;
+	pendingWall.length = 0;
+	if (dec) M._de_reset(dec);
+	awaitRap = true;
+}
+
 // Arbitrary NALs cannot be dropped from HEVC and still decode, so the only
 // clean unit is a whole GOP: throw everything away up to the newest random
 // access point and reset the decoder, or the DPB keeps references for pictures
@@ -140,12 +184,20 @@ function dropToRap() {
 	queue = queue.slice(cut);
 	queueBytes = queue.reduce((n, a) => n + a.bytes.length, 0);
 	stats.gopDrops++;
+	// The reset discards the pictures the decoder still held, so their
+	// capture times go with them, or the next picture out would be paired
+	// with a dropped one's instant.
+	pendingWall.length = 0;
 	M._de_reset(dec);
 }
 
 function requestIdr() {
-	if (ws && ws.readyState === 1) {
-		ws.send(JSON.stringify({ request: 'idr' }));
+	const text = JSON.stringify({ request: 'idr' });
+	if (feed) {
+		post('send', { text });
+		stats.idrRequests++;
+	} else if (ws && ws.readyState === 1) {
+		ws.send(text);
 		stats.idrRequests++;
 	}
 }
@@ -173,6 +225,16 @@ function pushAndDecode(au) {
 			drawCurrent();
 			M._de_release(dec);
 			stats.frames++;
+			// Pictures come out in the order they went in — a camera stream
+			// has no reordering — so the oldest capture time still pending is
+			// this picture's.
+			if (pendingWall.length) {
+				const wall = pendingWall.shift();
+				if (wall) {
+					lagMs.push(Date.now() - wall);
+					if (lagMs.length > LAG_KEEP) lagMs.shift();
+				}
+			}
 		}
 		if (flags & 8) { fail('decoder-error'); return; }
 	} while ((flags & 1) && ++guard < 64);
@@ -204,6 +266,7 @@ function pump() {
 	if (queue.length) {
 		const au = queue.shift();
 		queueBytes -= au.bytes.length;
+		pendingWall.push(au.wallMs || 0);
 		pushAndDecode(au.bytes);
 		if (!started) { started = true; post('state', { state: 'playing' }); }
 	}
@@ -225,8 +288,70 @@ async function start(opts) {
 	if (!gl) return fail('no-webgl');
 	paint = makePainter(gl);
 
-	openSocket(opts.url);
+	if (opts.feed) {
+		feed = true;
+		wsUrl = opts.url || '';
+		post('feed', { ok: true, protocol: 1 });
+	} else {
+		openSocket(opts.url);
+	}
 	pump();
+}
+
+// One text message from the transport: the camera's `init` line.
+function onText(text) {
+	let info; try { info = JSON.parse(text); } catch (_) { return false; }
+	if (!info || info.type !== 'init') return false;
+	// A channel switch can change the CODEC, not just the size: a camera
+	// commonly runs H.265 on the main channel and H.264 on the sub. This
+	// decoder only speaks H.265, so the honest move is to stand down and let
+	// the chain run again — MSE will take an H.264 substream natively, which
+	// is a better answer than this rung quietly feeding H.264 to an H.265
+	// decoder.
+	if (info.codec && !/^h265$|^hevc$/i.test(info.codec)) {
+		fail('codec-changed ' + info.codec);
+		return false;
+	}
+	post('info', { info });
+	return true;
+}
+
+// One binary message: the init segment, or a fragment. `isInit` is what a
+// feed says outright; a socket says nothing, and there the first binary
+// message is the init. Returns true when the init just landed.
+function onBinary(u8, isInit) {
+	stats.bytes += u8.length;
+	if (isInit || !init) {
+		if (!isInit && init) return false;
+		// The parameter sets live in the moov's hvcC and never appear in a
+		// fragment, so a decoder fed only fragments has no SPS and refuses
+		// every slice it is given.
+		init = u8;
+		const hv = parseHvcC(u8);
+		if (!hv) { fail('demux-failed'); return false; }
+		lengthSize = hv.lengthSize;
+		pushAndDecode(toAnnexB(hv.sets));
+		return true;
+	}
+	let wallMs = 0;
+	let frag = u8;
+	const pr = parsePrft(u8);
+	if (pr) { wallMs = pr.wallMs; frag = u8.subarray(pr.next); stats.prft = true; }
+	const nals = fragmentNals(frag, lengthSize);
+	if (!nals.length) return false;
+	const rap = nals.some((n) => isRap(nalType(n)));
+	if (awaitRap) {
+		// Only a random access point restarts the picture after a gap;
+		// anything else references frames that never arrived.
+		if (!rap) { stats.dropped++; return false; }
+		awaitRap = false;
+	}
+	const bytes = toAnnexB(nals);
+	noteArrival();
+	queue.push({ bytes, rap, wallMs });
+	queueBytes += bytes.length;
+	if (queueBytes > MAX_QUEUE_BYTES || queuedMs() > MAX_LATENCY_MS) dropToRap();
+	return false;
 }
 
 // A socket dropped mid-session: retry, or give up once the ladder is spent.
@@ -267,49 +392,18 @@ function openSocket(url, reconnect) {
 	if (dec) M._de_reset(dec);
 	ws = new WebSocket(url);
 	ws.binaryType = 'arraybuffer';
-	let init = null;
+	init = null;
+	pendingWall.length = 0;
 
 	ws.onmessage = (e) => {
-		if (typeof e.data === 'string') {
-			let info; try { info = JSON.parse(e.data); } catch (_) { return; }
-			if (!info || info.type !== 'init') return;
-			// A channel switch can change the CODEC, not just the size: a
-			// camera commonly runs H.265 on the main channel and H.264 on the
-			// sub. This decoder only speaks H.265, so the honest move is to
-			// stand down and let the chain run again — MSE will take an H.264
-			// substream natively, which is a better answer than this rung
-			// quietly feeding H.264 to an H.265 decoder.
-			if (info.codec && !/^h265$|^hevc$/i.test(info.codec)) {
-				return fail('codec-changed ' + info.codec);
-			}
-			post('info', { info });
-			return;
-		}
-		const u8 = new Uint8Array(e.data);
-		stats.bytes += u8.length;
-		if (!init) {
-			// The parameter sets live in the moov's hvcC and never appear in a
-			// fragment, so a decoder fed only fragments has no SPS and refuses
-			// every slice it is given.
-			init = u8;
+		if (typeof e.data === 'string') { onText(e.data); return; }
+		if (onBinary(new Uint8Array(e.data), false)) {
 			// A reconnect that reached its init is a working socket again, so
 			// the next drop starts a fresh ladder rather than counting toward an
 			// `unreachable` that has already been recovered from.
 			reconnectTries = 0;
 			reconnectBackoff = RECONNECT_BASE_MS;
-			const hv = parseHvcC(u8);
-			if (!hv) return fail('demux-failed');
-			lengthSize = hv.lengthSize;
-			pushAndDecode(toAnnexB(hv.sets));
-			return;
 		}
-		const nals = fragmentNals(u8, lengthSize);
-		if (!nals.length) return;
-		const bytes = toAnnexB(nals);
-		noteArrival();
-		queue.push({ bytes, rap: nals.some((n) => isRap(nalType(n))) });
-		queueBytes += bytes.length;
-		if (queueBytes > MAX_QUEUE_BYTES || queuedMs() > MAX_LATENCY_MS) dropToRap();
 	};
 	// A drop, not an ending: retry rather than fall to MJPEG. Fenced by the
 	// epoch so a close event from a socket we have already replaced (a channel
@@ -320,20 +414,68 @@ function openSocket(url, reconnect) {
 	ws.onerror = () => {};
 }
 
+// The lag samples, summarised: count, median, 95th percentile and maximum
+// of the capture-to-paint times seen since the last report was taken.
+function lagSummary() {
+	if (!lagMs.length) return { n: 0 };
+	const s = [...lagMs].sort((a, b) => a - b);
+	const at = (p) => s[Math.min(s.length - 1, Math.floor(p * s.length))];
+	return { n: s.length, p50: at(0.5), p95: at(0.95), max: s[s.length - 1] };
+}
+
 self.onmessage = (e) => {
 	const m = e.data;
 	if (m.type === 'start') start(m);
 	else if (m.type === 'idr') requestIdr();
+	else if (m.type === 'msg') {
+		// The feed's delivery: a text frame is the init line, a binary one
+		// the init segment (`kind` 2, said outright) or a fragment.
+		if (!feed || closed) return;
+		if (typeof m.data === 'string') { onText(m.data); return; }
+		const u8 = m.data instanceof Uint8Array ? m.data : new Uint8Array(m.data);
+		if (!init && m.kind !== 2 && m.kind !== undefined) { stats.noInit++; return; }
+		onBinary(u8, m.kind === 2);
+	}
+	else if (m.type === 'gap') {
+		// The feed lost frames: the page heard so from the camera, or saw a
+		// hole in its own sequence. The camera asks its own encoder for the
+		// keyframe when it flagged the gap; a page that found the hole itself
+		// asks through `idr` — not from here, which would double the request.
+		if (feed) { flushToRap(); stats.gaps++; }
+	}
+	else if (m.type === 'reset') {
+		// The feed was replaced (a channel change): the next init is a new
+		// stream's, and nothing from the old one may reach the decoder.
+		if (feed) { init = null; flushToRap(); awaitRap = false; lagMs = []; }
+	}
+	else if (m.type === 'open') {
+		// The page hands the transport back: from here the socket, its
+		// ladder and everything else behave as without a feed.
+		feed = false;
+		init = null;
+		openSocket(m.url || wsUrl);
+	}
 	else if (m.type === 'setStream') {
+		if (feed) { init = null; flushToRap(); awaitRap = false; return; }
 		openSocket(wsUrl.replace(/stream=\d+/, 'stream=' + (m.stream | 0)));
 	}
-	else if (m.type === 'stats') post('stats', { stats: Object.assign({}, stats, {
-		queuedBytes: queueBytes, queuedFrames: queue.length,
-		// What the page needs to decide whether to warn: how far behind the
-		// camera this client is, and how much of the interval decode eats.
-		queuedMs: Math.round(queuedMs()),
-		sourceIntervalMs: intervalMs(),
-	}) });
+	else if (m.type === 'stats') {
+		const lag = lagSummary();
+		const samples = lagMs;
+		lagMs = [];
+		post('stats', { stats: Object.assign({}, stats, {
+			queuedBytes: queueBytes, queuedFrames: queue.length,
+			// What the page needs to decide whether to warn: how far behind the
+			// camera this client is, and how much of the interval decode eats.
+			queuedMs: Math.round(queuedMs()),
+			sourceIntervalMs: intervalMs(),
+			feed, awaitingRap: awaitRap,
+			// Capture-to-paint, when the camera stamps its fragments: the
+			// summary and the raw samples since the last report, so a page
+			// or a harness can compute its own percentiles over a window.
+			lag, lagMs: samples,
+		}) });
+	}
 	else if (m.type === 'destroy') {
 		closed = true;
 		if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
