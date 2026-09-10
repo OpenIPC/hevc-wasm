@@ -28,26 +28,31 @@ w.onmessage = (e) => {
       (s.feed ? ' · feed' : '') + (s.gaps ? ' · gaps ' + s.gaps : '') +
       (s.lag && s.lag.n ? ' · capture→paint p50 ' + s.lag.p50 + 'ms p95 ' + s.lag.p95 + 'ms' : '');
   }
-  else if (m.type === 'feed') lines.feed = 'acknowledged, protocol ' + m.protocol;
+  else if (m.type === 'feed') { lines.feed = 'acknowledged, protocol ' + m.protocol; if (onFeed) { onFeed(); onFeed = null; } }
   else if (m.type === 'send' && ws && ws.readyState === 1) ws.send(m.text);
   show();
 };
 const params = new URLSearchParams(location.search);
 const url = proto + '://' + location.host + '/ws/video?stream=' + (params.get('stream') || 0);
 let ws = null;
+let onFeed = null;
 if (params.get('feed') === 'ws') {
-  w.postMessage({ type: 'start', feed: true, url, canvas: off }, [off]);
-  ws = new WebSocket(url);
-  ws.binaryType = 'arraybuffer';
-  let first = true;
-  ws.onmessage = (e) => {
-    if (typeof e.data === 'string') { w.postMessage({ type: 'msg', data: e.data }); return; }
-    // The socket says nothing about which binary message is the init; the
-    // first one is. A feed that knows says so with `kind`.
-    w.postMessage({ type: 'msg', data: e.data, kind: first ? 2 : 3 }, [e.data]);
-    first = false;
+  // The transport opens on the worker's acknowledgement, not before: a
+  // message sent while the decoder is still being created is dropped.
+  onFeed = () => {
+    ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
+    let first = true;
+    ws.onmessage = (e) => {
+      if (typeof e.data === 'string') { w.postMessage({ type: 'msg', data: e.data }); return; }
+      // The socket says nothing about which binary message is the init; the
+      // first one is. A feed that knows says so with `kind`.
+      w.postMessage({ type: 'msg', data: e.data, kind: first ? 2 : 3 }, [e.data]);
+      first = false;
+    };
+    ws.onclose = () => { lines.socket = 'closed'; show(); };
   };
-  ws.onclose = () => { lines.socket = 'closed'; show(); };
+  w.postMessage({ type: 'start', feed: true, url, canvas: off }, [off]);
 } else {
   w.postMessage({ type: 'start', url, canvas: off }, [off]);
 }

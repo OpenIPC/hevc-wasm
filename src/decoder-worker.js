@@ -50,6 +50,9 @@ let awaitRap = false;
 // and the absolute figure carries the camera's clock offset.
 const pendingWall = [];
 let lagMs = [];
+// The newest samples only, between two reports: a page that asks once a
+// second never reaches the bound, and one that asks less often gets the
+// most recent stretch rather than an unbounded array.
 const LAG_KEEP = 240;
 
 // Reconnect ladder, mirroring the MSE player (preview.js) exactly, because the
@@ -181,6 +184,10 @@ function dropToRap() {
 	queue = queue.slice(cut);
 	queueBytes = queue.reduce((n, a) => n + a.bytes.length, 0);
 	stats.gopDrops++;
+	// The reset discards the pictures the decoder still held, so their
+	// capture times go with them, or the next picture out would be paired
+	// with a dropped one's instant.
+	pendingWall.length = 0;
 	M._de_reset(dec);
 }
 

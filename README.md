@@ -56,6 +56,8 @@ camera that carries the same bitstream over one needs exactly this:
 ```js
 w.postMessage({ type: 'start', feed: true, url, canvas: off }, [off]);
 // -> { type: 'feed', ok: true, protocol: 1 }   nothing was opened
+// (send nothing before it: a message that arrives while the decoder is
+//  still being created is dropped)
 w.postMessage({ type: 'msg', data: initText });             // the text `init`
 w.postMessage({ type: 'msg', data: initSegment, kind: 2 }); // ftyp+moov
 w.postMessage({ type: 'msg', data: fragment, kind: 3 }, [fragment]); // [prft] moof+mdat
@@ -78,8 +80,10 @@ A fragment may start with a producer reference time (`prft`, ISO 14496-12
 §8.16.5), which a camera puts there when it knows the frame's capture
 instant. The worker strips it and reports capture-to-paint lag in `stats`:
 `lag: { n, p50, p95, max }` and the raw `lagMs` samples since the last
-report. The spread is exact; the absolute figure carries the camera's clock
-offset from this machine's.
+report — the newest 240 of them, so a page that asks once a second sees
+every frame and one that asks less often sees the latest stretch. The
+spread is exact; the absolute figure carries the camera's clock offset from
+this machine's.
 
 `dist/test.html?feed=ws` runs this mode over a plain WebSocket the page
 opens, so the byte compatibility can be checked against any camera;

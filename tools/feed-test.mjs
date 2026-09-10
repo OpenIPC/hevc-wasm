@@ -47,6 +47,7 @@ globalThis.self = {
 	onmessage: null,
 };
 await import(pathToFileURL(join(tmp, 'decoder-worker.mjs')).href);
+const { parsePrft } = await import(pathToFileURL(join(tmp, 'demux.mjs')).href);
 const send = (m) => self.onmessage({ data: m });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const last = (type) => { for (let i = out.length - 1; i >= 0; i--) if (out[i].type === type) return out[i]; return null; };
@@ -100,6 +101,15 @@ for (let i = 0; i < 200; i++) { send({ type: 'stats' }); if ((last('stats').stat
 let st = last('stats').stats;
 check(st.frames >= N - 4, 'decoded ' + st.frames + ' of ' + N + ' frames');
 check(st.prft === true && st.lag && st.lag.n > 0, 'lag measured from prft: n=' + (st.lag && st.lag.n));
+{
+	// Both box versions parse, and the next-box offset follows the version.
+	const v1 = withPrft(new Uint8Array(0), 0);
+	const v0 = v1.slice(0, 28); new DataView(v0.buffer).setUint32(0, 28); v0[8] = 0;
+	const p1 = parsePrft(v1), p0 = parsePrft(v0);
+	check(p1 && p1.next === 32 && p0 && p0.next === 28 && Math.abs(p1.wallMs - p0.wallMs) < 2, 'prft versions 0 and 1 parse: next ' + (p0 && p0.next) + '/' + (p1 && p1.next));
+	const v2 = v1.slice(); v2[8] = 2;
+	check(parsePrft(v2) === null, 'an unknown prft version is left in place');
+}
 check(st.lag && st.lag.p50 >= 100 && st.lag.p50 < 5000, 'lag p50 ' + (st.lag && st.lag.p50) + ' ms is the synthetic 120 ms plus decode');
 check(count('state') > 0 && last('state').state === 'playing', 'state playing');
 

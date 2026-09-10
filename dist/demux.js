@@ -95,10 +95,14 @@ export function fragmentNals(frag, lengthSize = 4) {
 // capture time as milliseconds since the Unix epoch and the offset of the
 // box that follows — or null when the fragment starts with something else.
 export function parsePrft(u8) {
-	if (u8.length < 32 || fourcc(u8, 4) !== 'prft') return null;
-	const size = be32(u8, 0);
-	if (size < 32 || size > u8.length) return null;
+	if (u8.length < 28 || fourcc(u8, 4) !== 'prft') return null;
 	const version = u8[8];
+	// Version 0 carries a 32-bit media_time (28 bytes in all), version 1 a
+	// 64-bit one (32 bytes); the timestamp sits at the same offset in both.
+	const need = version === 0 ? 28 : version === 1 ? 32 : 0;
+	if (!need) return null;
+	const size = be32(u8, 0);
+	if (size < need || size > u8.length) return null;
 	// 8 header + 4 version/flags + 4 reference_track_ID, then ntp_timestamp.
 	const secs = be32(u8, 16) - 2208988800;
 	const frac = be32(u8, 20);
