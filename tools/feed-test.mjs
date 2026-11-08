@@ -171,12 +171,21 @@ async function drain() {
 }
 async function feedOne(i) { clock += 100; send({ type: 'msg', data: withPrft(frags[i], 50), kind: 3 }); return drain(); }
 const GOP = 15;
+// These sections index three whole GOPs and need the GOP where the CI
+// fixture puts it; a shorter or differently cut stream is a failure to say
+// so, not a TypeError halfway through.
+const gopsOk = frags.length > 3 * GOP && [0, GOP, 2 * GOP, 3 * GOP].every((i) => isRapFrag(frags[i])) &&
+	!frags.slice(1, GOP).some(isRapFrag);
+check(gopsOk, 'fixture: ' + frags.length + ' fragments, a GOP every ' + GOP + ' frames (need more than ' + 3 * GOP + ')');
+if (!gopsOk) {
+	console.log('FEED TEST FAILED (' + failed + ')');
+	process.exit(1);
+}
 send({ type: 'reset' });
 send({ type: 'msg', data: init, kind: 2 });
 // Two whole GOPs at the measured cadence, decoded as they land, so the
 // arrival interval the bound reads is 100 ms.
 for (let i = 0; i < 2 * GOP; i++) await feedOne(i);
-check(isRapFrag(frags[2 * GOP]) && !isRapFrag(frags[2 * GOP + 1]), 'fixture: a GOP every ' + GOP + ' frames');
 // The IDR, decoded; then eight inter frames at once, faster than they decode.
 st = await feedOne(2 * GOP);
 const framesAtIdr = st.frames, idrAsked = st.idrRequests;
@@ -193,15 +202,30 @@ check(st.awaitingRap === false && st.frames === framesAtIdr + 1, 'resumed at the
 
 // ---- 8. falling behind when the oldest queued unit IS the RAP ----
 // Nothing older than it to drop, and dropping it would trade a late picture
-// for none until the next GOP. It is kept and decoded.
+// for none until the next GOP. Within twice the latency bound it is kept and
+// decoded: eight frames at 100 ms is 800 ms.
 send({ type: 'reset' });
 send({ type: 'msg', data: init, kind: 2 });
 st = stat();
 const framesAt8 = st.frames, droppedAt8 = st.dropped;
-for (let i = 0; i < 10; i++) { clock += 100; send({ type: 'msg', data: withPrft(frags[i], 50), kind: 3 }); }
+for (let i = 0; i < 8; i++) { clock += 100; send({ type: 'msg', data: withPrft(frags[i], 50), kind: 3 }); }
 st = await drain();
 check(st.dropped === droppedAt8, 'a queue led by its RAP is not thrown away: ' + (st.dropped - droppedAt8) + ' dropped');
-check(st.frames === framesAt8 + 10 && st.awaitingRap === false, 'all ten decoded: ' + (st.frames - framesAt8));
+check(st.frames === framesAt8 + 8 && st.awaitingRap === false, 'all eight decoded: ' + (st.frames - framesAt8));
+
+// ---- 9. ...but not without limit ----
+// Kept past twice the latency bound, a long GOP would run seconds behind the
+// camera. A whole GOP queued at once is 1.4 s: flushed, and decode waits for
+// the next RAP.
+send({ type: 'reset' });
+send({ type: 'msg', data: init, kind: 2 });
+st = stat();
+const framesAt9 = st.frames;
+for (let i = 0; i < GOP; i++) { clock += 100; send({ type: 'msg', data: withPrft(frags[i], 50), kind: 3 }); }
+st = await drain();
+check(st.awaitingRap === true && st.frames === framesAt9, 'a RAP-led queue past the ceiling is flushed: ' + (st.frames - framesAt9) + ' painted');
+st = await feedOne(GOP);
+check(st.awaitingRap === false && st.frames === framesAt9 + 1, 'resumed at the next RAP');
 Date.now = realNow;
 
 send({ type: 'destroy' });

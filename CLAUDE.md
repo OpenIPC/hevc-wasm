@@ -103,7 +103,9 @@ the IDR ahead of them decodes — it resets and decodes nothing until the next
 one**, holding the last good picture. Merely emptying the queue let the frames
 behind it decode against references libde265 conceals as flat mid-grey, so a
 slow client showed grey for the rest of every GOP it fell behind in. A queue led
-by its own RAP is kept: there is nothing older to cut. Asking the camera for a fresh IDR is rate limited and must stay so:
+by its own RAP has nothing older to cut, so it is kept while it stays within the
+byte bound and twice the latency bound; past either it is flushed the same way.
+Asking the camera for a fresh IDR is rate limited and must stay so:
 unlimited, it fired 32 times in 30 seconds, and each request costs an extra
 I-frame — the most expensive thing this decoder is handed — which puts the
 client further behind, which triggers the next drop.

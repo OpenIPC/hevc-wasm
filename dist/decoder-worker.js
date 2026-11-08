@@ -103,6 +103,11 @@ const stats = {
 // pitch is that it is a real video path.
 const MAX_QUEUE_BYTES = 4 << 20;
 const MAX_LATENCY_MS = 500;
+// How late a queue led by its own random access point may run before it is
+// thrown away too. Past the latency bound there is nothing older to cut from
+// such a queue, so it is given some slack rather than none -- but not a whole
+// GOP's worth, which on a long-GOP stream is seconds behind the camera.
+const MAX_HELD_RAP_MS = 2 * MAX_LATENCY_MS;
 // Long enough to outlast a GOP, so the natural random access point wins the
 // race whenever the stream has one coming.
 const IDR_MIN_GAP_MS = 3000;
@@ -159,11 +164,13 @@ function flushToRap() {
 function dropToRap() {
 	let cut = -1;
 	for (let i = queue.length - 1; i >= 0; i--) if (queue[i].rap) { cut = i; break; }
-	if (cut === 0 && queueBytes <= MAX_QUEUE_BYTES) {
+	if (cut === 0 && queueBytes <= MAX_QUEUE_BYTES && queuedMs() <= MAX_HELD_RAP_MS) {
 		// The oldest unit queued is already the newest random access point, so
 		// there is nothing older to cut. Dropping it would trade a late picture
-		// for no picture until the next GOP, which then lands just as late. The
-		// next random access point to arrive makes the cut possible.
+		// for no picture until the next GOP, so it is kept while the delay it
+		// carries stays within MAX_HELD_RAP_MS; the next random access point
+		// to arrive makes the cut possible. Past either bound it goes the way
+		// of a queue with no random access point at all, below.
 		return;
 	}
 	if (cut <= 0) {
