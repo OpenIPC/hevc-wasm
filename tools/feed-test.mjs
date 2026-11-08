@@ -150,6 +150,60 @@ send({ type: 'msg', data: withPrft(frags[0], 50), kind: 3 });
 send({ type: 'stats' });
 check(last('stats').stats.noInit >= 1, 'a frame before an init is counted, not decoded');
 
+// ---- 7. falling behind with no random access point queued ----
+// The usual way a slow client falls behind: the IDR is the dearest picture
+// to decode, the inter frames after it queue up while it decodes, and the
+// queue that crosses the latency bound holds inter frames only. Dropping
+// them leaves the decoder holding references to pictures that will never
+// arrive, so it has to be reset and fed nothing until the next random access
+// point — otherwise libde265 conceals the missing references as flat grey
+// pictures and paints every following inter frame over them.
+//
+// The latency bound is the queue length times the measured arrival interval,
+// so the clock is driven here: each message lands 100 ms after the last.
+const realNow = Date.now;
+let clock = realNow();
+Date.now = () => clock;
+const stat = () => { send({ type: 'stats' }); return last('stats').stats; };
+async function drain() {
+	for (let i = 0; i < 400; i++) { const s = stat(); if (!s.queuedFrames) return s; await sleep(10); }
+	return stat();
+}
+async function feedOne(i) { clock += 100; send({ type: 'msg', data: withPrft(frags[i], 50), kind: 3 }); return drain(); }
+const GOP = 15;
+send({ type: 'reset' });
+send({ type: 'msg', data: init, kind: 2 });
+// Two whole GOPs at the measured cadence, decoded as they land, so the
+// arrival interval the bound reads is 100 ms.
+for (let i = 0; i < 2 * GOP; i++) await feedOne(i);
+check(isRapFrag(frags[2 * GOP]) && !isRapFrag(frags[2 * GOP + 1]), 'fixture: a GOP every ' + GOP + ' frames');
+// The IDR, decoded; then eight inter frames at once, faster than they decode.
+st = await feedOne(2 * GOP);
+const framesAtIdr = st.frames, idrAsked = st.idrRequests;
+for (let i = 2 * GOP + 1; i <= 2 * GOP + 8; i++) { clock += 100; send({ type: 'msg', data: withPrft(frags[i], 50), kind: 3 }); }
+st = await drain();
+check(st.awaitingRap === true, 'behind with no RAP queued: awaiting the next one');
+check(st.frames === framesAtIdr, 'no inter frame decoded against a dropped reference: ' + (st.frames - framesAtIdr) + ' painted');
+check(st.idrRequests === idrAsked + 1, 'a keyframe asked for once');
+// The rest of the GOP still references what was dropped.
+for (let i = 2 * GOP + 9; i < 3 * GOP; i++) await feedOne(i);
+check(stat().frames === framesAtIdr, 'the rest of the GOP is dropped too');
+st = await feedOne(3 * GOP);
+check(st.awaitingRap === false && st.frames === framesAtIdr + 1, 'resumed at the next RAP');
+
+// ---- 8. falling behind when the oldest queued unit IS the RAP ----
+// Nothing older than it to drop, and dropping it would trade a late picture
+// for none until the next GOP. It is kept and decoded.
+send({ type: 'reset' });
+send({ type: 'msg', data: init, kind: 2 });
+st = stat();
+const framesAt8 = st.frames, droppedAt8 = st.dropped;
+for (let i = 0; i < 10; i++) { clock += 100; send({ type: 'msg', data: withPrft(frags[i], 50), kind: 3 }); }
+st = await drain();
+check(st.dropped === droppedAt8, 'a queue led by its RAP is not thrown away: ' + (st.dropped - droppedAt8) + ' dropped');
+check(st.frames === framesAt8 + 10 && st.awaitingRap === false, 'all ten decoded: ' + (st.frames - framesAt8));
+Date.now = realNow;
+
 send({ type: 'destroy' });
 console.log(failed ? 'FEED TEST FAILED (' + failed + ')' : 'FEED TEST PASSED');
 process.exit(failed ? 1 : 0);

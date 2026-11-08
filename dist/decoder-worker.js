@@ -159,10 +159,25 @@ function flushToRap() {
 function dropToRap() {
 	let cut = -1;
 	for (let i = queue.length - 1; i >= 0; i--) if (queue[i].rap) { cut = i; break; }
+	if (cut === 0 && queueBytes <= MAX_QUEUE_BYTES) {
+		// The oldest unit queued is already the newest random access point, so
+		// there is nothing older to cut. Dropping it would trade a late picture
+		// for no picture until the next GOP, which then lands just as late. The
+		// next random access point to arrive makes the cut possible.
+		return;
+	}
 	if (cut <= 0) {
-		// No random access point in hand, so nothing queued can start a decode
-		// and the queue is worthless either way.
-		//
+		// No random access point in hand. This is the usual way a slow client
+		// falls behind, not a corner case: the IDR is the dearest picture to
+		// decode, the inter frames after it queue up while it decodes, and the
+		// IDR itself has already left the queue. Everything queued references
+		// a picture this decoder will now never see, and so does everything
+		// still to come in this GOP. So the decoder is reset and fed nothing
+		// until the next random access point. Merely emptying the queue, as
+		// this once did, let the frames behind it decode against references
+		// libde265 conceals as flat grey pictures: a grey screen with
+		// motion smeared over it until the next keyframe, on every slow IDR.
+		flushToRap();
 		// Asking the camera for a fresh IDR is the obvious move and it is a
 		// TRAP on a client that is simply too slow: measured against 4K, this
 		// path fired 32 times in 30 seconds. Each request costs the camera an
@@ -174,8 +189,6 @@ function dropToRap() {
 		// So the request is rate limited, and between requests we simply wait
 		// for the next natural random access point. At a ~0.6 s GOP that is a
 		// cheaper wait than the IDR would have been.
-		stats.dropped += queue.length;
-		queue = []; queueBytes = 0;
 		const now = Date.now();
 		if (now - lastIdrAt > IDR_MIN_GAP_MS) { lastIdrAt = now; requestIdr(); }
 		return;
