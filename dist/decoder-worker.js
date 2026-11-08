@@ -103,6 +103,11 @@ const stats = {
 // pitch is that it is a real video path.
 const MAX_QUEUE_BYTES = 4 << 20;
 const MAX_LATENCY_MS = 500;
+// How late a queue led by its own random access point may run before it is
+// thrown away too. Past the latency bound there is nothing older to cut from
+// such a queue, so it is given some slack rather than none -- but not a whole
+// GOP's worth, which on a long-GOP stream is seconds behind the camera.
+const MAX_HELD_RAP_MS = 2 * MAX_LATENCY_MS;
 // Long enough to outlast a GOP, so the natural random access point wins the
 // race whenever the stream has one coming.
 const IDR_MIN_GAP_MS = 3000;
@@ -159,10 +164,27 @@ function flushToRap() {
 function dropToRap() {
 	let cut = -1;
 	for (let i = queue.length - 1; i >= 0; i--) if (queue[i].rap) { cut = i; break; }
+	if (cut === 0 && queueBytes <= MAX_QUEUE_BYTES && queuedMs() <= MAX_HELD_RAP_MS) {
+		// The oldest unit queued is already the newest random access point, so
+		// there is nothing older to cut. Dropping it would trade a late picture
+		// for no picture until the next GOP, so it is kept while the delay it
+		// carries stays within MAX_HELD_RAP_MS; the next random access point
+		// to arrive makes the cut possible. Past either bound it goes the way
+		// of a queue with no random access point at all, below.
+		return;
+	}
 	if (cut <= 0) {
-		// No random access point in hand, so nothing queued can start a decode
-		// and the queue is worthless either way.
-		//
+		// No random access point in hand. This is the usual way a slow client
+		// falls behind, not a corner case: the IDR is the dearest picture to
+		// decode, the inter frames after it queue up while it decodes, and the
+		// IDR itself has already left the queue. Everything queued references
+		// a picture this decoder will now never see, and so does everything
+		// still to come in this GOP. So the decoder is reset and fed nothing
+		// until the next random access point. Merely emptying the queue, as
+		// this once did, let the frames behind it decode against references
+		// libde265 conceals as flat grey pictures: a grey screen with
+		// motion smeared over it until the next keyframe, on every slow IDR.
+		flushToRap();
 		// Asking the camera for a fresh IDR is the obvious move and it is a
 		// TRAP on a client that is simply too slow: measured against 4K, this
 		// path fired 32 times in 30 seconds. Each request costs the camera an
@@ -174,8 +196,6 @@ function dropToRap() {
 		// So the request is rate limited, and between requests we simply wait
 		// for the next natural random access point. At a ~0.6 s GOP that is a
 		// cheaper wait than the IDR would have been.
-		stats.dropped += queue.length;
-		queue = []; queueBytes = 0;
 		const now = Date.now();
 		if (now - lastIdrAt > IDR_MIN_GAP_MS) { lastIdrAt = now; requestIdr(); }
 		return;
